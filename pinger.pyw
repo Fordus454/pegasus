@@ -6,12 +6,13 @@ from tkinter import filedialog, messagebox
 from pythonping import ping
 import pandas as pd
 import os
-from typing import Optional, Union, Any, List, TextIO  # Ensure TextIO is imported for type annotations
+from typing import Optional, Union, Any, List, TextIO, Dict  # Add Dict for type annotations
 from collections.abc import Mapping  # Use Mapping for type compatibility
 import traceback  # Added for detailed error logging
 from datetime import datetime  # Added for timestamped filenames
 import tkinter.scrolledtext as scrolledtext  # Import for the display box
 import sys  # Import for redirecting stdout
+import threading  # Import threading for background processing
 import time  # Import for adding delay
 
 # Fix type annotations for global variables
@@ -24,6 +25,9 @@ class ConsoleRedirector:
         self.text_widget = text_widget
 
     def write(self, message: str) -> None:
+        """
+        Writes a message to the display box and terminal.
+        """
         self.text_widget.config(state="normal")
         self.text_widget.insert("end", message)  # Append the new message with its original formatting
         self.text_widget.see("end")  # Scroll to the bottom
@@ -34,9 +38,16 @@ class ConsoleRedirector:
             sys.__stdout__.flush()
 
     def flush(self) -> None:
-        pass  # Required for compatibility with stdout
+        """
+        Required for compatibility with stdout.
+        """
+        pass
 
 def choose_file() -> None:
+    """
+    Opens a file dialog for the user to select a CSV file.
+    Updates the global `input_file` variable and displays the selected file path.
+    """
     global input_file
     input_file = filedialog.askopenfilename(filetypes=[("CSV Files", "*.csv")])
     if input_file:
@@ -45,6 +56,10 @@ def choose_file() -> None:
         file_label.config(text="No file selected")
 
 def process_file() -> None:
+    """
+    Processes the selected CSV file to detect IP addresses, ping them, and save the results.
+    Runs the processing in a separate thread to keep the GUI responsive.
+    """
     global output_file
     if not input_file:
         processing_label.config(text="Error: Please select an input file first.", fg="red")
@@ -56,105 +71,129 @@ def process_file() -> None:
     root.update_idletasks()
 
     # Display "Processing..." message
-    processing_label.config(text="Processing...                                                                           ", fg="blue")
+    processing_label.config(text="Processing...", fg="blue")
     root.update_idletasks()
 
-    # Add a 1-second delay before starting processing
-    time.sleep(1)
-
-    try:
-        # Load the input file
-        print("Loading input file...")
-        root.update_idletasks()  # Ensure the display box updates immediately
-        df: pd.DataFrame = pd.read_csv(input_file, header=None)  # Load without assuming headers
-        print(f"Initial DataFrame shape: {df.shape}")
-        root.update_idletasks()
-
-        # Detect the column containing IP addresses based on the '10.' prefix
-        ip_col: Optional[int] = None
-        header_row: int = -1  # Default to no header
-        for col in df.columns:
-            for i, value in enumerate(df[col].astype(str)):
-                if value.startswith("10."):  # Check if the value starts with "10."
-                    ip_col = col
-                    header_row = i - 1  # The row above the first valid IP is the header
-                    break
-            if ip_col is not None:
-                break
-
-        if ip_col is None:
-            processing_label.config(text="Error: No column with valid IP addresses detected.", fg="red")
-            print("Error: No column with valid IP addresses detected.")
+    def process_in_background():
+        """
+        Background thread function to process the CSV file.
+        Detects the IP address column, pings the IPs, and saves the results.
+        """
+        try:
+            # Load the input file and detect the header row
+            print("Loading input file...")
             root.update_idletasks()
-            return
+            header_row = None
+            with open(input_file, 'r') as file:
+                for i, line in enumerate(file):
+                    # Look for a keyword in the header row to detect headers
+                    if "IP Address" in line:
+                        header_row = i
+                        break
 
-        print(f"Detected IP address column: {ip_col}")
-        print(f"Header row detected at: {header_row}")
-        root.update_idletasks()
+            # If no header row is found, assume the file has no headers
+            if header_row is None:
+                print("No header row detected. Assuming the file has no headers.")
+                df: pd.DataFrame = pd.read_csv(input_file, header=None, on_bad_lines='skip')
+                # Assign default column names for headerless files
+                df.columns = [f"Column_{i}" for i in range(len(df.columns))]
+            else:
+                # Load the CSV file, skipping metadata rows
+                df: pd.DataFrame = pd.read_csv(input_file, header=header_row, on_bad_lines='skip')
 
-        # Adjust the DataFrame to remove leading rows and set the header
-        headerless: bool = header_row < 0
-        if not headerless:
-            df = pd.read_csv(input_file, header=header_row)  # Reload with the correct header row
-            print("Re-loaded file with headers.")
-        else:
-            # For headerless files, process all rows as data without skipping the first row
-            df.columns = [str(col) for col in df.columns]  # Use default integer-based column names
-            print("Processed file without headers.")
+            print(f"Initial DataFrame shape: {df.shape}")
+            root.update_idletasks()
 
-        # Ensure all rows after the starting row are processed
-        df = df.reset_index(drop=True)  # Reset index to ensure proper row processing
-        print(f"DataFrame shape after resetting index: {df.shape}")
-        root.update_idletasks()
+            # Detect the column containing IP addresses
+            ip_col: Optional[str] = None
+            for col in df.columns:
+                header_value = str(col).lower()  # Use column names directly as headers
+                # Skip columns with irrelevant keywords
+                if "last known" in header_value or "gateway" in header_value:
+                    continue
+                # Prioritize columns with "IP Address" in the header
+                if "ip address" in header_value:
+                    if df[col].astype(str).str.match(r'^\d{1,3}(\.\d{1,3}){3}$', na=False).any():
+                        ip_col = col
+                        break
 
-        # Add a 'Status' column
-        print("Pinging IP addresses...")
-        root.update_idletasks()
-        df["Status"] = ""
-        for index, row in df.iterrows():
-            ip = str(row[ip_col]).strip() if pd.notna(row[ip_col]) else None
-            try:
-                if ip and ip.startswith("10."):
-                    print(f"Pinging {ip}...")
-                    root.update_idletasks()
-                    avg_ping = ping(ip, count=3).rtt_avg_ms
-                    if avg_ping < 2000:
-                        df.at[index, "Status"] = f"Online at {avg_ping:.2f} avg ms ping"
-                        print(f"{ip} is Online at {avg_ping:.2f} avg ms")
+            # Fallback: Check all columns if no "IP Address" header is found
+            if ip_col is None:
+                for col in df.columns:
+                    if df[col].astype(str).str.match(r'^\d{1,3}(\.\d{1,3}){3}$', na=False).any():
+                        ip_col = col
+                        break
+
+            if ip_col is None:
+                # If no valid IP address column is found, display an error
+                processing_label.config(text="Error: No column with valid IP addresses detected.", fg="red")
+                print("Error: No column with valid IP addresses detected.")
+                root.update_idletasks()
+                return
+
+            print(f"Detected IP address column: {ip_col}")
+            root.update_idletasks()
+
+            # Filter rows with valid IP addresses
+            df = df[df[ip_col].astype(str).str.match(r'^\d{1,3}(\.\d{1,3}){3}$', na=False)].reset_index(drop=True)
+            print(f"Filtered DataFrame shape: {df.shape}")
+            root.update_idletasks()
+
+            # Add a 'Status' column to store ping results
+            print("Pinging IP addresses...")
+            root.update_idletasks()
+            df["Status"] = ""
+            for index, row in df.iterrows():
+                ip = str(row[ip_col]).strip() if pd.notna(row[ip_col]) else None
+                try:
+                    if ip:
+                        print(f"Pinging {ip}...")
+                        root.update_idletasks()
+                        avg_ping = ping(ip, count=3).rtt_avg_ms
+                        if avg_ping < 2000:
+                            df.at[index, "Status"] = f"Online at {avg_ping:.2f} avg ms ping"
+                            print(f"{ip} is Online at {avg_ping:.2f} avg ms")
+                        else:
+                            df.at[index, "Status"] = "Error: IP Offline during process"
+                            print(f"{ip} is Offline (timeout)")
                     else:
-                        df.at[index, "Status"] = "Error: IP Offline during process"
-                        print(f"{ip} is Offline (timeout)")
-                else:
-                    df.at[index, "Status"] = "Error: Invalid or missing IP address"
-                    print(f"Row {index} has an invalid or missing IP address.")
-                root.update_idletasks()
-            except Exception as e:
-                df.at[index, "Status"] = "Error: IP Offline during process"
-                print(f"Error pinging {ip}: {e}")
-                root.update_idletasks()
+                        df.at[index, "Status"] = "Error: Invalid or missing IP address"
+                        print(f"Row {index} has an invalid or missing IP address.")
+                    root.update_idletasks()
+                except Exception as e:
+                    # Handle errors during pinging
+                    df.at[index, "Status"] = "Error: IP Offline during process"
+                    print(f"Error pinging {ip}: {e}")
+                    root.update_idletasks()
 
-        # Save the results
-        timestamp = datetime.now().strftime("%m-%d-%Y")
-        output_file = os.path.splitext(input_file)[0] + f"_{timestamp}_results.csv"
-        if headerless:
-            df.to_csv(output_file, index=False, header=False)  # Exclude headers for headerless files
-        else:
-            df.to_csv(output_file, index=False, header=True)  # Include headers for files with headers
-        processing_label.config(text="File processed successfully.", fg="green")
-        output_label.config(text=f"Results saved to: {output_file}", fg="green")  # Update output label
-    except pd.errors.EmptyDataError:
-        processing_label.config(text="Error: The input file is empty or invalid.", fg="red")
-        print("Error: The input file is empty or invalid.")
-        root.update_idletasks()
-    except Exception as e:
-        processing_label.config(text="Error: An unexpected error occurred. Check console for details.", fg="red")
-        print("An unexpected error occurred:")
-        traceback.print_exc()
-        root.update_idletasks()
-    finally:
-        root.update_idletasks()
+            # Save the results to a new CSV file
+            timestamp = datetime.now().strftime("%m-%d-%Y")
+            output_file = os.path.splitext(input_file)[0] + f"_{timestamp}_results.csv"
+            df.to_csv(output_file, index=False)  # Save with headers
+            processing_label.config(text="File processed successfully.", fg="green")
+            output_label.config(text=f"Results saved to: {output_file}", fg="green")  # Update output label
+        except pd.errors.EmptyDataError:
+            # Handle empty or invalid input files
+            processing_label.config(text="Error: The input file is empty or invalid.", fg="red")
+            print("Error: The input file is empty or invalid.")
+            root.update_idletasks()
+        except Exception as e:
+            # Handle unexpected errors
+            processing_label.config(text="Error: An unexpected error occurred. Check console for details.", fg="red")
+            print("An unexpected error occurred:")
+            traceback.print_exc()
+            root.update_idletasks()
+        finally:
+            root.update_idletasks()
+
+    # Run the processing in a separate thread to keep the GUI responsive
+    threading.Thread(target=process_in_background, daemon=True).start()
 
 def download_results() -> None:
+    """
+    Allows the user to save the processed results to a different location.
+    Opens a save dialog and moves the output file to the selected location.
+    """
     global output_file
     if not output_file:
         processing_label.config(text="Error: No processed file available to download.", fg="red")
